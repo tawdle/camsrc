@@ -162,8 +162,10 @@ eos_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
   app_data * app = user_data;
 
-  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_DATA (info)) != GST_EVENT_EOS)
+  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_DATA (info)) != GST_EVENT_EOS) {
+    g_printf ("got another event that wasn't our EOS; ignoring\n");
     return GST_PAD_PROBE_OK;
+  }
 
   g_printf("Received EOS event\n");
 
@@ -184,30 +186,32 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 
   /*g_print ("blockpad_probe_cb: pts = %ld dts = %ld\n", pts, dts);*/
 
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
   app_data * app = user_data;
 
   GST_DEBUG_OBJECT (pad, "pad is blocked now");
 
   g_printf ("Unlinking mux...\n");
-
   gst_element_unlink (app->queue2, app->mux);
 
-  g_printf ("Setting event probe...\n");
+  g_printf ("Pausing queue...\n");
+  set_state_and_wait ( app->queue2, GST_STATE_PAUSED, app);
 
+  g_printf ("Setting event probe...\n");
   GstPad * srcpad = gst_element_get_static_pad (app->mux, "src");
   gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, eos_probe_cb, app, NULL);
   gst_object_unref (srcpad);
 
-  g_printf ("Sending EOS...\n");
-
+  g_printf ("Getting sinkpad... ");
   GstPad * sinkpad = gst_element_get_static_pad (app->mux, "video_0");
-
   g_printf ("sinkpad is %p\n", sinkpad);
 
+  g_printf ("Generating new EOS... ");
   GstEvent * event = gst_event_new_eos ();
-
   g_printf ("event is %p\n", event);
 
+  g_printf ("Sending event...\n");
   gst_pad_send_event (sinkpad, event);
   gst_object_unref (sinkpad);
 
@@ -218,12 +222,10 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 void block_pipeline(app_data *app)
 {
   g_print ("Blocking pipeline...\n");
-  if (!app->block_probe_id) {
-    g_printf ("Adding blocking probe...\n");
-    app->block_probe_id = gst_pad_add_probe (
-        app->blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
-        blockpad_probe_cb, app, NULL);
-  }
+  g_printf ("Adding blocking probe...\n");
+  app->block_probe_id = gst_pad_add_probe (
+      app->blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+      blockpad_probe_cb, app, NULL);
 
 }
 
@@ -291,6 +293,17 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       break;
   }
   return TRUE;
+}
+
+static gboolean
+timeout_cb (gpointer user_data)
+{
+  app_data * app = user_data;
+
+  gst_pad_add_probe (app->blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
+      blockpad_probe_cb, user_data, NULL);
+
+  return FALSE;
 }
 
 int
@@ -377,18 +390,20 @@ main (int   argc,
   g_print ("Starting pipeline...\n");
   set_state_and_wait (app.pipeline, GST_STATE_PLAYING, &app);
 
-  block_pipeline (&app);
+  /*block_pipeline (&app);*/
 
   GIOChannel *io = NULL;
   guint io_watch_id = 0;
 
   /* set up control pipe */
-  char * control_pipe = "/tmp/gerald";
+  char * control_pipe = "/dev/stdin";
   mkfifo(control_pipe, 0666);
   int pipe = g_open(control_pipe, O_RDONLY, O_NONBLOCK);
   io = g_io_channel_unix_new (pipe);
   io_watch_id = g_io_add_watch (io, G_IO_IN, io_callback, &app);
   g_io_channel_unref (io);
+
+  g_timeout_add_seconds (5, timeout_cb, app.loop);
 
   /* Iterate */
   g_print ("Running...\n");
