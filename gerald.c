@@ -59,12 +59,19 @@ typedef struct {
   gboolean blocking;
 } app_data;
 
+app_data global_app_data;
+
+void unblock_pipeline(app_data *app, char * output_location);
+
 void set_state_and_wait (GstElement * element, GstState state, app_data * app)
 {
   GstState new_state;
 
+  g_printf ("set_state_and_wait: setting state to %s\n", gst_element_state_get_name (state));
+
   switch (gst_element_set_state (element, state)) {
     case GST_STATE_CHANGE_SUCCESS:
+      g_printf ("Got immediate state change success\n");
       break;
     case GST_STATE_CHANGE_ASYNC:
       g_print ("Waiting for async state change... ");
@@ -82,15 +89,27 @@ void set_state_and_wait (GstElement * element, GstState state, app_data * app)
       return;
       break;
     case GST_STATE_CHANGE_NO_PREROLL:
+      g_print ("no prerolll\n");
       break;
   }
 }
 
-void drop_mux_and_sink (app_data * app)
+void drop_bin (app_data * app)
 {
-  g_printf ("Unlinking and removing bin...\n");
-  gst_element_unlink (app->queue2, app->bin);
-  set_state_and_wait(app->bin, GST_STATE_NULL, app);
+  GstElement * old_bin = app->bin;
+
+  g_printf ("Unlinking bin...\n");
+  gst_element_unlink (app->queue2, old_bin);
+
+  g_print ("Unblocking pipeline...\n");
+
+  // Send a few frames to the bit bucket...
+  unblock_pipeline (app, "/dev/null");
+
+  g_printf ("set_state_and_wait\n");
+  gst_element_set_state (app->bin, GST_STATE_NULL);
+  /*set_state_and_wait(app->bin, GST_STATE_NULL, app);*/
+  g_printf ("removing bin\n");
   gst_bin_remove (GST_BIN(app->pipeline), app->bin);
   g_printf("done!\n");
 }
@@ -107,8 +126,7 @@ bus_call (GstBus     *bus,
 
     case GST_MESSAGE_EOS:
       g_print ("End of stream detected on bus\n");
-      drop_mux_and_sink (app);
-      /*g_main_loop_quit (app->loop);*/
+      g_main_loop_quit (app->loop);
       break;
 
     case GST_MESSAGE_ERROR:
@@ -135,65 +153,18 @@ bus_call (GstBus     *bus,
 }
 
 
-#if 0
-static void
-on_pad_added (GstElement *element,
-    GstPad     *pad,
-    gpointer    data)
-{
-  GstPad *sinkpad;
-  GstElement *decoder = (GstElement *) data;
-
-  /* We can now link this pad with the vorbis-decoder sink pad */
-  g_print ("Dynamic pad created, linking demuxer/decoder\n");
-
-  sinkpad = gst_element_get_static_pad (decoder, "sink");
-
-  gst_pad_link (pad, sinkpad);
-
-  gst_object_unref (sinkpad);
-}
-#endif
-
-#if 0
-static GstPadProbeReturn
-eos_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
-{
-  app_data * app = user_data;
-  GstEvent * event;
-
-  g_printf ("In eos_probe_cb with %p, %p, and %p\n", pad, info, user_data);
-
-  event = gst_pad_probe_info_get_event (info);
-
-  g_printf ("event type from event is %x\n", event->type);
-
-  if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_DATA (info)) != GST_EVENT_EOS) {
-    g_printf ("got another event type %x that wasn't our EOS %x; ignoring\n", GST_EVENT_TYPE(GST_PAD_PROBE_INFO_DATA(info)), GST_EVENT_EOS);
-    return GST_PAD_PROBE_OK;
-  }
-
-  g_printf("Received EOS event!\n");
-
-  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
-
-  /*drop_mux_and_sink(app);*/
-
-  return GST_PAD_PROBE_OK;
-}
-#endif
-
-
 static GstPadProbeReturn
 blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
-  app_data * app = user_data;
-
-  /*gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));*/
-
+  g_printf ("pad is blocked now\n");
   GST_DEBUG_OBJECT (pad, "pad is blocked now");
 
-  gst_element_send_event (app->mux, gst_event_new_eos());
+  // Can we send to the element like this?
+  // gst_element_send_event (app->mux, gst_event_new_eos());
+
+  GstPad * peer = gst_pad_get_peer (pad);
+  gst_pad_send_event (peer, gst_event_new_eos ());
+  gst_object_unref (peer);
 
   g_printf("Sent! Now we wait.\n");
   return GST_PAD_PROBE_OK;
@@ -206,16 +177,21 @@ void block_pipeline(app_data *app)
   app->block_probe_id = gst_pad_add_probe (
       app->blockpad, GST_PAD_PROBE_TYPE_BLOCK_DOWNSTREAM,
       blockpad_probe_cb, app, NULL);
+}
 
+static void
+gst_bin_handle_message_func (GstBin * bin, GstMessage * message)
+{
+  if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS) {
+    drop_bin(&global_app_data);
+  }
 }
 
 void unblock_pipeline(app_data *app, char * output_location)
 {
-  GstPad * sinkpad;
-
   g_printf ("Saving stream to %s...\n", output_location);
 
-  app->bin = gst_element_factory_make ("bin", "bin");
+  app->bin = gst_element_factory_make ("bin", NULL);
   app->mux = gst_element_factory_make ("mp4mux", "mux");
   app->sink = gst_element_factory_make ("filesink", "sink");
 
@@ -230,15 +206,19 @@ void unblock_pipeline(app_data *app, char * output_location)
   g_object_set (app->sink, "location", output_location, NULL);
 
   gst_bin_add_many (GST_BIN (app->bin), app->mux, app->sink, NULL);
-  gst_element_link_many (app->mux, app->sink, NULL);
 
-  gst_element_add_pad(app->bin, gst_ghost_pad_new_no_target ("sink", GST_PAD_SINK));
+  gst_element_link (app->mux, app->sink);
+
+  gst_element_add_pad(app->bin, gst_ghost_pad_new ("sink", gst_element_get_request_pad (app->mux, "video_%u")));
 
   gst_bin_add (GST_BIN(app->pipeline), app->bin);
 
   gst_element_link (app->queue2, app->bin);
 
   gst_element_sync_state_with_parent (app->bin);
+
+  GstBinClass * bin_class = GST_BIN_GET_CLASS(app->bin);
+  bin_class->handle_message = gst_bin_handle_message_func;
 
   if (app->block_probe_id) {
     gst_pad_remove_probe (app->blockpad, app->block_probe_id);
@@ -307,8 +287,7 @@ main (int   argc,
 {
   GstBus *bus;
   guint bus_watch_id;
-  app_data ad;
-  app_data * app = &ad;
+  app_data * app = &global_app_data;
 
   /* Initialisation */
   gst_init (&argc, &argv);
@@ -382,7 +361,7 @@ main (int   argc,
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
 
-  unblock_pipeline (app, "/dev/null");
+  unblock_pipeline (app, "first.mp4");
 
   // Verbose
    g_signal_connect (app->pipeline, "deep-notify",
