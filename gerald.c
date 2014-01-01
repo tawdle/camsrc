@@ -31,6 +31,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdlib.h>
 
 typedef enum {
   STATUS_IDLE,
@@ -55,6 +56,9 @@ typedef struct {
   guint file_count;
   gboolean is_blocking;
   gulong blockpad_probe_id;
+  GstClockTime base_time;
+  GstClockTime clock_start;
+  GstClockTime clock_end;
 } app_data;
 
 app_data global_app_data;
@@ -135,7 +139,6 @@ bus_call (GstBus     *bus,
   return TRUE;
 }
 
-
 GstElement * create_bin (char * output_location, app_data * app)
 {
   g_printf ("Saving stream to %s...\n", output_location);
@@ -187,23 +190,82 @@ void block_pipeline(app_data *app)
       blockpad_probe_cb, app, NULL);
 }
 
-static GstPadProbeReturn
-wait_for_keyframe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+static gint inside_window(GstPadProbeInfo * info, app_data * app)
 {
+  GstClockTime pts = GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info));
+
+  gint ret = pts < app->clock_start ? -1 : pts >= app->clock_end ? 1 : 0;
+
+  g_printf ("pts check : %lu %s [%lu, %lu]\n", pts,
+      ret == -1 ? "before" : ret == 1 ? "after" : "inside",
+      app->clock_start, app->clock_end);
+
+  return ret;
+}
+
+static GstPadProbeReturn
+wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  app_data * app = data;
+
+
+  switch (inside_window(info, app)) {
+    case -1:
+      g_printerr ("Somehow we're before our window looking for end");
+      break;
+
+    case 0:
+      g_print ("Passing along a frame that is in window\n");
+      return GST_PAD_PROBE_PASS;
+
+    case 1:
+    default:
+      g_print ("Now seeing a frame beyond our window; initiating block sequence\n");
+      break;
+  }
+
+
+  gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+  block_pipeline(app);
+
+  return GST_PAD_PROBE_DROP;
+}
+
+
+static GstPadProbeReturn
+wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  app_data * app = data;
+
   GstBufferFlags flags;
-
-  g_print ("Waiting for keyframe...\n");
-
-  g_printf ("Buffer PTS is %lu\n", GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info)));
 
   flags = GST_BUFFER_FLAGS(GST_PAD_PROBE_INFO_BUFFER (info));
 
-  if (!(flags & GST_BUFFER_FLAG_DELTA_UNIT)) {
-    g_print ("Found a key frame!\n");
-    return GST_PAD_PROBE_REMOVE;
-  } else {
+  if (flags & GST_BUFFER_FLAG_DELTA_UNIT) {
     g_print ("Dropping a delta frame\n");
     return GST_PAD_PROBE_DROP;
+  }
+
+  switch (inside_window(info, app)) {
+    case -1:
+      g_printf ("Dropping a frame that is too old\n");
+      return GST_PAD_PROBE_DROP;
+    case 0:
+      g_print ("Found a key frame that is in range\n");
+
+      gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
+      gst_pad_add_probe (app->blockpad,
+          GST_PAD_PROBE_TYPE_BUFFER,
+          wait_for_end_cb, app, NULL);
+
+      return GST_PAD_PROBE_PASS;
+    default:
+    case 1:
+      g_printerr ("Didn't find a keyframe in range!\n");
+      gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+      block_pipeline(app);
+      return GST_PAD_PROBE_DROP;
   }
 }
 
@@ -220,13 +282,21 @@ void unblock_pipeline(app_data *app)
 
   gst_pad_add_probe (app->blockpad,
       GST_PAD_PROBE_TYPE_BUFFER,
-      wait_for_keyframe_cb, app, NULL);
+      wait_for_start_cb, app, NULL);
 
   if (app->blockpad_probe_id) {
     g_print ("Unblocking pipeline\n");
     gst_pad_remove_probe (app->blockpad, app->blockpad_probe_id);
     app->blockpad_probe_id = 0;
   }
+}
+
+static GstClockTime get_current_time()
+{
+  GTimeVal current_time;
+
+  g_get_current_time (&current_time);
+  return GST_TIMEVAL_TO_TIME (current_time);
 }
 
 gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
@@ -238,6 +308,8 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
   switch (g_io_channel_read_line_string(source, buffer, NULL, &error)) {
     case G_IO_STATUS_NORMAL:
       g_strstrip(buffer->str);
+      if (!strcmp (buffer->str, ""))
+        break;
       g_print("received command %s\n", buffer->str);
       if (!strcmp("start", buffer->str)) {
         unblock_pipeline(app);
@@ -249,6 +321,30 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       } else if (!strcmp("shutdown", buffer->str)) {
         g_print("Shutting down\n");
         g_main_loop_quit (app->loop);
+      } else if (g_str_has_prefix(buffer->str, "replay ")) {
+        GstClockTime current_duration;
+        glong relative_start;
+        glong duration;
+        gchar * next = &buffer->str[7];
+
+        relative_start = strtol(next, &next, 10);
+        duration = strtol(next, &next, 10);
+
+        current_duration = GST_CLOCK_DIFF(app->base_time, get_current_time());
+
+        if (-relative_start * GST_SECOND > current_duration)
+          relative_start = -GST_TIME_AS_SECONDS(current_duration);
+
+        g_print ("%20lu: get_current_time()\n",  get_current_time());
+        g_print ("%20lu: base_time\n", app->base_time);
+        g_print ("%20lu: get_current_time - base_time\n", get_current_time() - app->base_time);
+        g_print ("%20ld: relative_start * GST_SECOND\n", relative_start * GST_SECOND);
+
+        app->clock_start = current_duration + relative_start * GST_SECOND;
+        app->clock_end = app->clock_start + duration * GST_SECOND;
+
+        g_print ("replaying with %lu and %lu\n", GST_TIME_AS_MSECONDS(app->clock_start), GST_TIME_AS_MSECONDS(app->clock_end));
+        unblock_pipeline(app);
       } else {
         g_print("Unrecognized command\n");
       }
@@ -325,9 +421,10 @@ main (int   argc,
 
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
   g_object_set (app->source, "is-live", TRUE, NULL);
-  g_object_set (app->queue2, "max-size-bytes", 10 * 1024 * 1024, NULL);
+  g_object_set (app->queue2, "max-size-bytes", 500 * 1024 * 1024, NULL);
   g_object_set (app->queue2, "leaky", GST_QUEUE_LEAK_DOWNSTREAM, NULL);
   g_object_set (app->encoder, "byte-stream", TRUE, NULL);
+  g_object_set (app->encoder, "key-int-max", 1, NULL);
 
   /* Set up the pipeline */
 
@@ -357,6 +454,8 @@ main (int   argc,
   /* Set the pipeline to "playing" state*/
   g_print ("Starting pipeline...\n");
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
+
+  app->base_time = get_current_time();
 
   GIOChannel *io = NULL;
   guint io_watch_id = 0;
