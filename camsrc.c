@@ -398,7 +398,7 @@ main (int   argc,
   app->blockpad_probe_id = 0;
 
   /* Create gstreamer elements */
-  app->pipeline  = gst_pipeline_new ("gerald");
+  app->pipeline  = gst_pipeline_new ("camsrc");
   app->source    = gst_element_factory_make ("videotestsrc", "video-source");
   app->caps      = gst_element_factory_make ("capsfilter", "caps-filter");
   app->videorate = gst_element_factory_make ("videorate", "video-rate");
