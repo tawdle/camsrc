@@ -1,28 +1,12 @@
 /*
- We can't successfully get caps neogotiated unless the pipeline is complete when we start it.
- So here's what we do:
-
- At the start, we put everything together, pointing filesink at /dev/null.
- We set the pipeline state to playing; when we detect that the pipeline actually is playing,
- we shut down the back-end.
-
- To do the shut-down, we follow the recommeneded technique:
-
- * block the srcpad on queue2
- * unlink the mux from queue2
- * set an event probe on mux's srcpad
- * send an EOS on mux's sink pad
- * when we receive the EOS on the probe on mux's srcpad, we remove the probe and drop the EOS
- * then we set the states on mux and sink to NULL
- * we may need to wait for the sink to go to NULL
- * when it does, we remove it
- *
- * To start a save, we:
- * create a mux and a sink, point the sink at the right fd
- * add the mux and sink to the pipeline
- * link queue2 => mux
- * set states of mux and sink to PLAYING
- * remove the block on queue2's srcpad
+ * Things to do:
+ * * protect against multiple overlapping requests
+ * * on startup, choose a camera
+ * X on startup, choose a named pipe
+ * * adjust start time to account for keyframes
+ * * in replay replay request, take some form of absolute datetime
+ * * in replay request, take name of pipe for output
+ * X look into ORC for Mac OS and Linux
  * */
 
 #include <gst/gst.h>
@@ -44,6 +28,7 @@ typedef struct {
   GMainLoop  *loop;
   GstElement *pipeline;
   GstElement *source;
+  GstElement *caps;
   GstElement *videorate;
   GstElement *converter;
   GstElement *queue1;
@@ -59,6 +44,7 @@ typedef struct {
   GstClockTime base_time;
   GstClockTime clock_start;
   GstClockTime clock_end;
+  GstClockTime clock_desired_duration;
 } app_data;
 
 app_data global_app_data;
@@ -167,8 +153,6 @@ GstElement * create_bin (char * output_location, app_data * app)
 static GstPadProbeReturn
 blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
-  g_print ("Inside blockpad_probe_cb\n");
-
   app_data * app = user_data;
   GstElement * mux = gst_bin_get_by_name (GST_BIN(app->bin), "mux");
   GstPad * mux_sink_pad = gst_element_get_static_pad (mux, "video_0");
@@ -176,7 +160,6 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   /*gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));*/
 
   gst_pad_send_event (mux_sink_pad, gst_event_new_eos());
-  g_print ("Returned from send_event\n");
   g_object_unref (mux_sink_pad);
 
   return GST_PAD_PROBE_OK;
@@ -184,21 +167,25 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 
 void block_pipeline(app_data *app)
 {
-  g_print ("Blocking pipeline...\n");
   app->blockpad_probe_id = gst_pad_add_probe (app->blockpad,
       GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER,
       blockpad_probe_cb, app, NULL);
 }
 
-static gint inside_window(GstPadProbeInfo * info, app_data * app)
+static gint inside_window(GstPadProbeInfo * info, app_data * app, gboolean need_keyframe)
 {
   GstClockTime pts = GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info));
+  GstBufferFlags flags = GST_BUFFER_FLAGS(GST_PAD_PROBE_INFO_BUFFER (info));
+  gboolean have_keyframe = (flags & GST_BUFFER_FLAG_DELTA_UNIT) != GST_BUFFER_FLAG_DELTA_UNIT;
 
   gint ret = pts < app->clock_start ? -1 : pts >= app->clock_end ? 1 : 0;
 
-  g_printf ("pts check : %lu %s [%lu, %lu]\n", pts,
-      ret == -1 ? "before" : ret == 1 ? "after" : "inside",
-      app->clock_start, app->clock_end);
+  /*g_printf ("pts check : %lu%s %s [%lu, %lu]\n", pts, have_keyframe ? "*" : "",*/
+      /*ret == -1 ? "before" : ret == 1 ? "after" : "inside",*/
+      /*app->clock_start, app->clock_end);*/
+
+  if (need_keyframe && !have_keyframe && ret == 0)
+    ret = -1;
 
   return ret;
 }
@@ -209,18 +196,17 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
   app_data * app = data;
 
 
-  switch (inside_window(info, app)) {
+  switch (inside_window(info, app, FALSE)) {
     case -1:
       g_printerr ("Somehow we're before our window looking for end");
       break;
 
     case 0:
-      g_print ("Passing along a frame that is in window\n");
+      /*g_print ("Passing along a frame that is in window\n");*/
       return GST_PAD_PROBE_PASS;
 
     case 1:
     default:
-      g_print ("Now seeing a frame beyond our window; initiating block sequence\n");
       break;
   }
 
@@ -237,21 +223,14 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 {
   app_data * app = data;
 
-  GstBufferFlags flags;
-
-  flags = GST_BUFFER_FLAGS(GST_PAD_PROBE_INFO_BUFFER (info));
-
-  if (flags & GST_BUFFER_FLAG_DELTA_UNIT) {
-    g_print ("Dropping a delta frame\n");
-    return GST_PAD_PROBE_DROP;
-  }
-
-  switch (inside_window(info, app)) {
+  switch (inside_window(info, app, TRUE)) {
     case -1:
-      g_printf ("Dropping a frame that is too old\n");
+      /*g_printf ("Dropping a frame that is too old\n");*/
       return GST_PAD_PROBE_DROP;
     case 0:
-      g_print ("Found a key frame that is in range\n");
+      /*g_print ("Found a key frame that is in range\n");*/
+
+      app->clock_end = GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info)) + app->clock_desired_duration;
 
       gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
 
@@ -259,6 +238,7 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
           GST_PAD_PROBE_TYPE_BUFFER,
           wait_for_end_cb, app, NULL);
 
+      /*g_print ("Scanning for end frame\n");*/
       return GST_PAD_PROBE_PASS;
     default:
     case 1:
@@ -285,10 +265,11 @@ void unblock_pipeline(app_data *app)
       wait_for_start_cb, app, NULL);
 
   if (app->blockpad_probe_id) {
-    g_print ("Unblocking pipeline\n");
+    /*g_print ("Unblocking pipeline\n");*/
     gst_pad_remove_probe (app->blockpad, app->blockpad_probe_id);
     app->blockpad_probe_id = 0;
   }
+  /*g_print ("Scanning for key frame\n");*/
 }
 
 static GstClockTime get_current_time()
@@ -321,6 +302,26 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       } else if (!strcmp("shutdown", buffer->str)) {
         g_print("Shutting down\n");
         g_main_loop_quit (app->loop);
+      } else if (!strcmp("query", buffer->str)) {
+        GstClockTime level_time;
+        guint level_bytes;
+        guint level_buffers;
+
+        g_object_get (app->queue1,
+            "current-level-time", &level_time,
+            "current-level-bytes", &level_bytes,
+            "current-level-buffers", &level_buffers, NULL);
+
+        g_printf("queue1 reports %lums, %u buffers, %u bytes\n",
+            GST_TIME_AS_MSECONDS(level_time), level_buffers, level_bytes);
+
+        g_object_get (app->queue2,
+            "current-level-time", &level_time,
+            "current-level-bytes", &level_bytes,
+            "current-level-buffers", &level_buffers, NULL);
+
+        g_printf("queue2 reports %lums, %u buffers, %u bytes\n",
+            GST_TIME_AS_MSECONDS(level_time), level_buffers, level_bytes);
       } else if (g_str_has_prefix(buffer->str, "replay ")) {
         GstClockTime current_duration;
         glong relative_start;
@@ -335,15 +336,16 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         if (-relative_start * GST_SECOND > current_duration)
           relative_start = -GST_TIME_AS_SECONDS(current_duration);
 
-        g_print ("%20lu: get_current_time()\n",  get_current_time());
-        g_print ("%20lu: base_time\n", app->base_time);
-        g_print ("%20lu: get_current_time - base_time\n", get_current_time() - app->base_time);
-        g_print ("%20ld: relative_start * GST_SECOND\n", relative_start * GST_SECOND);
+        /*g_print ("%20lu: get_current_time()\n",  get_current_time());*/
+        /*g_print ("%20lu: base_time\n", app->base_time);*/
+        /*g_print ("%20lu: get_current_time - base_time\n", get_current_time() - app->base_time);*/
+        /*g_print ("%20ld: relative_start * GST_SECOND\n", relative_start * GST_SECOND);*/
 
         app->clock_start = current_duration + relative_start * GST_SECOND;
-        app->clock_end = app->clock_start + duration * GST_SECOND;
+        app->clock_desired_duration = duration * GST_SECOND;
+        app->clock_end = app->clock_start + app->clock_desired_duration;
 
-        g_print ("replaying with %lu and %lu\n", GST_TIME_AS_MSECONDS(app->clock_start), GST_TIME_AS_MSECONDS(app->clock_end));
+        /*g_print ("replaying with %lu and %lu\n", GST_TIME_AS_MSECONDS(app->clock_start), GST_TIME_AS_MSECONDS(app->clock_desired_duration));*/
         unblock_pipeline(app);
       } else {
         g_print("Unrecognized command\n");
@@ -372,9 +374,22 @@ main (int   argc,
   GstBus *bus;
   guint bus_watch_id;
   app_data * app = &global_app_data;
+  GOptionContext * option_context;
+  GError * error;
+  char * control_pipe = "/dev/stdin";
+
+  GOptionEntry option_entries[] = {
+    { "pipe", 'p', 0, G_OPTION_ARG_STRING, &control_pipe, "Pathname of control pipe", "PIPE" },
+    { NULL }
+  };
 
   /* Initialisation */
   gst_init (&argc, &argv);
+
+  option_context = g_option_context_new ("- start queue-buffered video server");
+  g_option_context_add_main_entries (option_context, option_entries, NULL);
+  g_option_context_parse (option_context, &argc, &argv, &error);
+  g_option_context_free (option_context);
 
   app->status = STATUS_IDLE;
   app->file_count = 0;
@@ -382,16 +397,10 @@ main (int   argc,
   app->is_blocking = TRUE;
   app->blockpad_probe_id = 0;
 
-  /* Check input arguments */
-  /*if (argc != 2) {*/
-    /*g_printerr ("Usage: %s <Ogg/Vorbis filename>\n", argv[0]);*/
-    /*return -1;*/
-  /*}*/
-
-
   /* Create gstreamer elements */
   app->pipeline  = gst_pipeline_new ("gerald");
   app->source    = gst_element_factory_make ("videotestsrc", "video-source");
+  app->caps      = gst_element_factory_make ("capsfilter", "caps-filter");
   app->videorate = gst_element_factory_make ("videorate", "video-rate");
   app->converter = gst_element_factory_make ("videoconvert", "video-convert");
   app->queue1    = gst_element_factory_make ("queue", "upstream-queue");
@@ -401,6 +410,7 @@ main (int   argc,
 
   if (!app->pipeline) { g_printerr ("Failed to create pipeline"); }
   if (!app->source) { g_printerr("failed to create videotestsrc"); }
+  if (!app->caps) { g_printerr ("Failed to create capsfilter"); }
   if (!app->videorate) { g_printerr("failed to create video-rate"); }
   if (!app->converter) { g_printerr("failed to create videoconvert"); }
   if (!app->queue1) { g_printerr("failed to create upstream-queue"); }
@@ -409,6 +419,7 @@ main (int   argc,
 
   if (!app->pipeline ||
       !app->source ||
+      !app->caps ||
       !app->videorate ||
       !app->converter ||
       !app->queue1 ||
@@ -421,38 +432,49 @@ main (int   argc,
 
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
   g_object_set (app->source, "is-live", TRUE, NULL);
-  g_object_set (app->queue2, "max-size-bytes", 500 * 1024 * 1024, NULL);
-  g_object_set (app->queue2, "leaky", GST_QUEUE_LEAK_DOWNSTREAM, NULL);
+  g_object_set (app->source, "pattern", 18, NULL);
+  g_object_set (app->queue2,
+      "leaky", GST_QUEUE_LEAK_DOWNSTREAM,
+      "max-size-bytes", 500 * 1024 * 1024,
+      "max-size-buffers", 0,
+      "max-size-time", 0,
+      NULL);
   g_object_set (app->encoder, "byte-stream", TRUE, NULL);
-  g_object_set (app->encoder, "key-int-max", 1, NULL);
+  g_object_set (app->encoder, "key-int-max", 30, NULL);
 
-  /* Set up the pipeline */
+  GstCaps *caps;
+  caps = gst_caps_new_simple ("video/x-raw",
+      "format", G_TYPE_STRING, "I420",
+      "framerate", GST_TYPE_FRACTION, 30, 1,
+      "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
+      "width", G_TYPE_INT, 1920,
+      "height", G_TYPE_INT, 1080,
+      NULL);
+
+  g_object_set (app->caps, "caps", caps, NULL);
 
   /* Add a message handler */
   bus = gst_pipeline_get_bus (GST_PIPELINE (app->pipeline));
   bus_watch_id = gst_bus_add_watch (bus, bus_call, app);
   gst_object_unref (bus);
 
-  g_print("Adding elements...\n");
   /* Add elements up to the second queue -- the "fixed" part of the pipeline */
   gst_bin_add_many (GST_BIN (app->pipeline),
-      app->source, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
+      app->source, app->caps, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
 
-  g_print("Linking elements...\n");
   /* we link the elements together */
   gst_element_link_many (
-      app->source, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
+      app->source, app->caps, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
 
   block_pipeline(app);
 
-  // Verbose
+   /*Verbose*/
   /*g_signal_connect (app->pipeline, "deep-notify",*/
     /*G_CALLBACK (gst_object_default_deep_notify), NULL);*/
 
-  /* Set the pipeline to "playing" state*/
-  g_print ("Starting pipeline...\n");
+  /* Set the pipeline to "playing" state */
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
 
   app->base_time = get_current_time();
@@ -461,22 +483,20 @@ main (int   argc,
   guint io_watch_id = 0;
 
   /* set up control pipe */
-  char * control_pipe = "/dev/stdin";
   mkfifo(control_pipe, 0666);
-  int pipe = g_open(control_pipe, O_RDONLY, O_NONBLOCK);
+  int pipe = g_open(control_pipe, O_RDONLY | O_NONBLOCK, 0);
   io = g_io_channel_unix_new (pipe);
   io_watch_id = g_io_add_watch (io, G_IO_IN, io_callback, app);
   g_io_channel_unref (io);
 
   /* Iterate */
-  g_print ("Running...\n");
+  g_printf ("Listening on %s...\n", control_pipe);
+
   g_main_loop_run (app->loop);
 
   /* Out of the main loop, clean up nicely */
-  g_print ("Returned, stopping playback\n");
   gst_element_set_state (app->pipeline, GST_STATE_NULL);
 
-  g_print ("Deleting pipeline\n");
   gst_object_unref (GST_OBJECT (app->pipeline));
   g_source_remove (bus_watch_id);
   g_main_loop_unref (app->loop);
