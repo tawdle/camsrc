@@ -16,6 +16,12 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <gio/gio.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+
+#define PORT 2000
 
 typedef enum {
   STATUS_IDLE,
@@ -45,40 +51,11 @@ typedef struct {
   GstClockTime clock_start;
   GstClockTime clock_end;
   GstClockTime clock_desired_duration;
+  GSocketConnection * connection;
+  guint socket_watcher_id;
 } app_data;
 
 app_data global_app_data;
-
-void set_state_and_wait (GstElement * element, GstState state, app_data * app)
-{
-  GstState new_state;
-
-  g_printf ("set_state_and_wait: setting state to %s\n", gst_element_state_get_name (state));
-
-  switch (gst_element_set_state (element, state)) {
-    case GST_STATE_CHANGE_SUCCESS:
-      g_printf ("Got immediate state change success\n");
-      break;
-    case GST_STATE_CHANGE_ASYNC:
-      g_print ("Waiting for async state change... ");
-      if (gst_element_get_state (element, &new_state, NULL, 1 * GST_SECOND) !=
-          GST_STATE_CHANGE_SUCCESS || new_state != state) {
-        g_printerr ("sink failed to change state to %s; is stuck at %s\n", gst_element_state_get_name (state), gst_element_state_get_name (new_state));
-        /*g_main_loop_quit (app->loop);*/
-        return;
-      }
-      g_print ("got it.\n");
-      break;
-    case GST_STATE_CHANGE_FAILURE:
-      g_printerr ("state change failure");
-      g_main_loop_quit (app->loop);
-      return;
-      break;
-    case GST_STATE_CHANGE_NO_PREROLL:
-      g_print ("no prerolll\n");
-      break;
-  }
-}
 
 void drop_bin (app_data * app)
 {
@@ -86,6 +63,52 @@ void drop_bin (app_data * app)
   gst_bin_remove (GST_BIN(app->pipeline), app->bin);
 }
 
+static void hangup (app_data * app)
+{
+  if (app->connection) {
+    g_source_remove (app->socket_watcher_id);
+    g_object_unref (app->connection);
+    app->connection = NULL;
+  }
+}
+
+gint get_file_descriptor (app_data * app)
+{
+  gint fd = app->connection ? g_socket_get_fd (g_socket_connection_get_socket (app->connection)) : g_open ("/dev/null", O_WRONLY, 0);
+  return fd;
+}
+
+static void send_result_to_socket (app_data * app)
+{
+  gint src, dest = get_file_descriptor (app);
+  struct stat stat_buf;
+  gchar * file_location;
+  gchar response[1024];
+  gchar cwd[1024];
+  ssize_t sent;
+
+  if (!app->connection) return;
+
+  g_object_get (gst_bin_get_by_name (GST_BIN(app->bin), "sink"),
+      "location", &file_location, NULL);
+
+  src = g_open (file_location, O_RDONLY);
+  fstat (src, &stat_buf);
+  close (src);
+
+  getcwd(cwd, sizeof(cwd));
+
+  g_snprintf (response, sizeof(response),
+      "{ \"content-type\": \"video/mp4\", \"content-length\": %lld, \"location\": \"%s/%s\" }\n",
+      stat_buf.st_size, cwd, file_location);
+
+  if ((sent = write (dest, response, strlen(response))) < strlen(response)) {
+    g_printf ("whoops! entire header didn't get sent (only %zd bytes of %lu).", sent, strlen(response));
+  }
+
+  /* clean up and exit */
+  g_free (file_location);
+}
 
 static gboolean
 bus_call (GstBus     *bus,
@@ -97,9 +120,10 @@ bus_call (GstBus     *bus,
   switch (GST_MESSAGE_TYPE (msg)) {
 
     case GST_MESSAGE_EOS:
-      g_print ("End of stream detected on bus\n");
+      g_print ("Finished writing stream\n");
+      send_result_to_socket (app);
       drop_bin (app);
-      /*g_main_loop_quit (app->loop);*/
+      hangup (app);
       break;
 
     case GST_MESSAGE_ERROR:
@@ -180,9 +204,10 @@ static gint inside_window(GstPadProbeInfo * info, app_data * app, gboolean need_
 
   gint ret = pts < app->clock_start ? -1 : pts >= app->clock_end ? 1 : 0;
 
-  /*g_printf ("pts check : %lu%s %s [%lu, %lu]\n", pts, have_keyframe ? "*" : "",*/
-      /*ret == -1 ? "before" : ret == 1 ? "after" : "inside",*/
-      /*app->clock_start, app->clock_end);*/
+  /*if (have_keyframe)*/
+    /*g_printf ("pts check : %lu%s %s [%lu, %lu]\n", pts, have_keyframe ? "*" : "",*/
+        /*ret == -1 ? "before" : ret == 1 ? "after" : "inside",*/
+        /*app->clock_start, app->clock_end);*/
 
   if (need_keyframe && !have_keyframe && ret == 0)
     ret = -1;
@@ -298,30 +323,38 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       } else if (!strcmp("stop", buffer->str)) {
         block_pipeline(app);
       } else if (!strcmp("pause", buffer->str)) {
-        set_state_and_wait (app->pipeline, GST_STATE_PAUSED, app);
+        gst_element_set_state (app->pipeline, GST_STATE_PAUSED);
       } else if (!strcmp("shutdown", buffer->str)) {
         g_print("Shutting down\n");
         g_main_loop_quit (app->loop);
       } else if (!strcmp("query", buffer->str)) {
-        GstClockTime level_time;
-        guint level_bytes;
-        guint level_buffers;
+        GstClockTime level_time_1, level_time_2;
+        guint level_bytes_1, level_bytes_2;
+        guint level_buffers_1, level_buffers_2;
+        char buff[1024];
+        gsize bytes_written;
 
         g_object_get (app->queue1,
-            "current-level-time", &level_time,
-            "current-level-bytes", &level_bytes,
-            "current-level-buffers", &level_buffers, NULL);
-
-        g_printf("queue1 reports %lums, %u buffers, %u bytes\n",
-            GST_TIME_AS_MSECONDS(level_time), level_buffers, level_bytes);
+            "current-level-time", &level_time_1,
+            "current-level-bytes", &level_bytes_1,
+            "current-level-buffers", &level_buffers_1, NULL);
 
         g_object_get (app->queue2,
-            "current-level-time", &level_time,
-            "current-level-bytes", &level_bytes,
-            "current-level-buffers", &level_buffers, NULL);
+            "current-level-time", &level_time_2,
+            "current-level-bytes", &level_bytes_2,
+            "current-level-buffers", &level_buffers_2, NULL);
 
-        g_printf("queue2 reports %lums, %u buffers, %u bytes\n",
-            GST_TIME_AS_MSECONDS(level_time), level_buffers, level_bytes);
+        g_snprintf(buff, 1024,
+            "queue1 reports %lums, %u buffers, %u bytes\n"
+            "queue2 reports %lums, %u buffers, %u bytes\n",
+            GST_TIME_AS_MSECONDS(level_time_1), level_buffers_1, level_bytes_1,
+            GST_TIME_AS_MSECONDS(level_time_2), level_buffers_2, level_bytes_2);
+
+        g_io_channel_write_chars (source, buff, -1, &bytes_written, &error);
+        g_io_channel_flush (source, &error);
+        hangup (app);
+        return FALSE;
+
       } else if (g_str_has_prefix(buffer->str, "replay ")) {
         GstClockTime current_duration;
         glong relative_start;
@@ -352,18 +385,38 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       }
       break;
     case G_IO_STATUS_ERROR:
-      g_print("no!!! error");
+      g_printf("G_IO_STATUS_ERROR: %s", error->message);
       g_error_free (error);
-      break;
+      return FALSE;
     case G_IO_STATUS_EOF:
-      g_print("EOF reached\n");
-      break;
+      g_printf ("Client is gone");
+      hangup (app);
+      return FALSE;
     case G_IO_STATUS_AGAIN:
-      return TRUE;
+      break;
     default:
       g_return_val_if_reached(FALSE);
-      break;
   }
+  return TRUE;
+}
+
+gboolean
+incoming_callback  (GSocketService *service,
+                    GSocketConnection *connection,
+                    GObject *source_object,
+                    gpointer user_data)
+{
+  GError * error = NULL;
+  app_data * app = user_data;
+
+  g_print("Received Connection from client!\n");
+  g_object_ref (connection);
+  app->connection = connection;
+
+  GIOChannel *channel = g_io_channel_unix_new (get_file_descriptor (app));
+  app->socket_watcher_id = g_io_add_watch (channel, G_IO_IN, (GIOFunc) io_callback, app);
+  g_io_channel_set_encoding (channel, NULL, &error);
+  g_io_channel_set_close_on_unref (channel, TRUE);
   return TRUE;
 }
 
@@ -375,11 +428,11 @@ main (int   argc,
   guint bus_watch_id;
   app_data * app = &global_app_data;
   GOptionContext * option_context;
-  GError * error;
-  char * control_pipe = "/dev/stdin";
+  GError * error = NULL;
+  gint port = PORT;
 
   GOptionEntry option_entries[] = {
-    { "pipe", 'p', 0, G_OPTION_ARG_STRING, &control_pipe, "Pathname of control pipe", "PIPE" },
+    { "port", 'p', 0, G_OPTION_ARG_INT, &port, "Port to listen on (default 2000)", "PORT" },
     { NULL }
   };
 
@@ -391,11 +444,23 @@ main (int   argc,
   g_option_context_parse (option_context, &argc, &argv, &error);
   g_option_context_free (option_context);
 
+  /* set up socket */
+  GSocketService * service = g_socket_service_new ();
+  g_socket_listener_add_inet_port ((GSocketListener*)service, port, NULL, &error);
+
+  if (error) {
+    g_error (error->message);
+  }
+
+  g_signal_connect (service, "incoming", G_CALLBACK (incoming_callback), app);
+  g_socket_service_start (service);
+
   app->status = STATUS_IDLE;
   app->file_count = 0;
   app->loop = g_main_loop_new (NULL, FALSE);
   app->is_blocking = TRUE;
   app->blockpad_probe_id = 0;
+  app->connection = NULL;
 
   /* Create gstreamer elements */
   app->pipeline  = gst_pipeline_new ("camsrc");
@@ -479,18 +544,7 @@ main (int   argc,
 
   app->base_time = get_current_time();
 
-  GIOChannel *io = NULL;
-  guint io_watch_id = 0;
-
-  /* set up control pipe */
-  mkfifo(control_pipe, 0666);
-  int pipe = g_open(control_pipe, O_RDONLY | O_NONBLOCK, 0);
-  io = g_io_channel_unix_new (pipe);
-  io_watch_id = g_io_add_watch (io, G_IO_IN, io_callback, app);
-  g_io_channel_unref (io);
-
-  /* Iterate */
-  g_printf ("Listening on %s...\n", control_pipe);
+  g_printf ("Listening on port %d...\n", port);
 
   g_main_loop_run (app->loop);
 
@@ -500,7 +554,6 @@ main (int   argc,
   gst_object_unref (GST_OBJECT (app->pipeline));
   g_source_remove (bus_watch_id);
   g_main_loop_unref (app->loop);
-  unlink(control_pipe);
 
   return 0;
 }
