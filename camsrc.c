@@ -18,22 +18,14 @@
 #include <sys/uio.h>
 
 #define PORT 2000
+#define GST_QUEUE_LEAK_DOWNSTREAM 2
 
 typedef struct {
   GMainLoop  *loop;
   GstElement *pipeline;
-  GstElement *source;
-  GstElement *caps;
-  GstElement *videorate;
-  GstElement *converter;
-  GstElement *queue1;
-  GstElement *encoder;
   GstElement *queue2;
   GstElement *bin;
-  GstElement *mux;
   GstPad * blockpad;
-  guint file_count;
-  gboolean is_blocking;
   gulong blockpad_probe_id;
   GstClockTime base_time;
   GstClockTime clock_start;
@@ -42,21 +34,19 @@ typedef struct {
   GSocketConnection * connection;
   guint socket_watcher_id;
   gchar * file_location;
-} app_data;
-
-app_data global_app_data;
+} App;
 
 // Set up debug output
 GST_DEBUG_CATEGORY_STATIC (camsrc);
 #define GST_CAT_DEFAULT camsrc
 
-void drop_bin (app_data * app)
+void drop_bin (App * app)
 {
   gst_element_set_state (app->bin, GST_STATE_NULL);
   gst_bin_remove (GST_BIN(app->pipeline), app->bin);
 }
 
-static void hangup (app_data * app)
+static void hangup (App * app)
 {
   if (app->connection) {
     g_source_remove (app->socket_watcher_id);
@@ -65,13 +55,13 @@ static void hangup (app_data * app)
   }
 }
 
-gint get_file_descriptor (app_data * app)
+gint get_file_descriptor (App * app)
 {
   gint fd = app->connection ? g_socket_get_fd (g_socket_connection_get_socket (app->connection)) : g_open ("/dev/null", O_WRONLY, 0);
   return fd;
 }
 
-static void send_result_to_socket (app_data * app)
+static void send_result_to_socket (App * app)
 {
   gint src, dest = get_file_descriptor (app);
   struct stat stat_buf;
@@ -101,7 +91,7 @@ bus_call (GstBus     *bus,
     GstMessage *msg,
     gpointer    data)
 {
-  app_data * app = data;
+  App * app = data;
 
   switch (GST_MESSAGE_TYPE (msg)) {
 
@@ -135,7 +125,7 @@ bus_call (GstBus     *bus,
   return TRUE;
 }
 
-GstElement * create_bin (char * output_location, app_data * app)
+GstElement * create_bin (char * output_location, App * app)
 {
   GST_LOG ("Saving stream to %s...", output_location);
 
@@ -163,7 +153,7 @@ GstElement * create_bin (char * output_location, app_data * app)
 static GstPadProbeReturn
 blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
-  app_data * app = user_data;
+  App * app = user_data;
   GstElement * mux = gst_bin_get_by_name (GST_BIN(app->bin), "mux");
   GstPad * mux_sink_pad = gst_element_get_static_pad (mux, "video_0");
 
@@ -175,14 +165,14 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_OK;
 }
 
-void block_pipeline(app_data *app)
+void block_pipeline(App *app)
 {
   app->blockpad_probe_id = gst_pad_add_probe (app->blockpad,
       GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER,
       blockpad_probe_cb, app, NULL);
 }
 
-static gint inside_window(GstPadProbeInfo * info, app_data * app, gboolean need_keyframe)
+static gint inside_window(GstPadProbeInfo * info, App * app, gboolean need_keyframe)
 {
   GstClockTime pts = GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info));
   GstBufferFlags flags = GST_BUFFER_FLAGS(GST_PAD_PROBE_INFO_BUFFER (info));
@@ -204,7 +194,7 @@ static gint inside_window(GstPadProbeInfo * info, app_data * app, gboolean need_
 static GstPadProbeReturn
 wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 {
-  app_data * app = data;
+  App * app = data;
 
 
   switch (inside_window(info, app, FALSE)) {
@@ -232,7 +222,7 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 static GstPadProbeReturn
 wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 {
-  app_data * app = data;
+  App * app = data;
 
   switch (inside_window(info, app, TRUE)) {
     case -1:
@@ -261,7 +251,7 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 }
 
 
-void unblock_pipeline(app_data *app)
+void unblock_pipeline(App *app)
 {
   app->bin = create_bin (app->file_location, app);
   gst_bin_add (GST_BIN(app->pipeline), app->bin);
@@ -292,7 +282,7 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
 {
   GError *error = NULL;
   GString *buffer = g_string_new(NULL);
-  app_data * app = data;
+  App * app = data;
 
   switch (g_io_channel_read_line_string(source, buffer, NULL, &error)) {
     case G_IO_STATUS_NORMAL:
@@ -311,16 +301,10 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         GST_LOG("Shutting down");
         g_main_loop_quit (app->loop);
       } else if (!strcmp("query", buffer->str)) {
-        GstClockTime level_time_1, level_time_2;
-        guint level_bytes_1, level_bytes_2;
-        guint level_buffers_1, level_buffers_2;
+        GstClockTime level_time_2;
+        guint level_bytes_2, level_buffers_2;
         char buff[1024];
         gsize bytes_written;
-
-        g_object_get (app->queue1,
-            "current-level-time", &level_time_1,
-            "current-level-bytes", &level_bytes_1,
-            "current-level-buffers", &level_buffers_1, NULL);
 
         g_object_get (app->queue2,
             "current-level-time", &level_time_2,
@@ -328,9 +312,7 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
             "current-level-buffers", &level_buffers_2, NULL);
 
         g_snprintf(buff, 1024,
-            "queue1 reports %lums, %u buffers, %u bytes\n"
             "queue2 reports %lums, %u buffers, %u bytes\n",
-            GST_TIME_AS_MSECONDS(level_time_1), level_buffers_1, level_bytes_1,
             GST_TIME_AS_MSECONDS(level_time_2), level_buffers_2, level_bytes_2);
 
         g_io_channel_write_chars (source, buff, -1, &bytes_written, &error);
@@ -398,7 +380,7 @@ incoming_callback  (GSocketService *service,
                     gpointer user_data)
 {
   GError * error = NULL;
-  app_data * app = user_data;
+  App * app = user_data;
 
   GST_LOG ("Received Connection from client!");
   g_object_ref (connection);
@@ -417,7 +399,8 @@ main (int   argc,
 {
   GstBus *bus;
   guint bus_watch_id;
-  app_data * app = &global_app_data;
+  App app_data;
+  App * app = &app_data;
   GOptionContext * option_context;
   GError * error = NULL;
   gint port = PORT;
@@ -447,59 +430,50 @@ main (int   argc,
   g_signal_connect (service, "incoming", G_CALLBACK (incoming_callback), app);
   g_socket_service_start (service);
 
-  app->file_count = 0;
   app->loop = g_main_loop_new (NULL, FALSE);
-  app->is_blocking = TRUE;
   app->blockpad_probe_id = 0;
   app->connection = NULL;
 
   /* Create gstreamer elements */
   app->pipeline  = gst_pipeline_new ("camsrc");
-  app->source    = gst_element_factory_make ("videotestsrc", "video-source");
-  app->caps      = gst_element_factory_make ("capsfilter", "caps-filter");
-  app->videorate = gst_element_factory_make ("videorate", "video-rate");
-  app->converter = gst_element_factory_make ("videoconvert", "video-convert");
-  app->queue1    = gst_element_factory_make ("queue", "upstream-queue");
-  app->encoder   = gst_element_factory_make ("x264enc", "video-encoder");
+
+  GstElement * source    = gst_element_factory_make ("videotestsrc", "video-source"),
+             * filter    = gst_element_factory_make ("capsfilter", "caps-filter"),
+             * videorate = gst_element_factory_make ("videorate", "video-rate"),
+             * converter = gst_element_factory_make ("videoconvert", "video-convert"),
+             * queue1    = gst_element_factory_make ("queue", "upstream-queue"),
+             * encoder   = gst_element_factory_make ("x264enc", "video-encoder");
+
   app->queue2    = gst_element_factory_make ("queue", "ringbuffer-queue");
   app->bin       = create_bin ("/dev/null", app);
 
   if (!app->pipeline) { GST_ERROR ("Failed to create pipeline"); }
-  if (!app->source) { GST_ERROR("failed to create videotestsrc"); }
-  if (!app->caps) { GST_ERROR ("Failed to create capsfilter"); }
-  if (!app->videorate) { GST_ERROR("failed to create video-rate"); }
-  if (!app->converter) { GST_ERROR("failed to create videoconvert"); }
-  if (!app->queue1) { GST_ERROR("failed to create upstream-queue"); }
-  if (!app->encoder) { GST_ERROR("failed to create encoder"); }
+  if (!source) { GST_ERROR("failed to create videotestsrc"); }
+  if (!filter) { GST_ERROR ("Failed to create capsfilter"); }
+  if (!videorate) { GST_ERROR("failed to create video-rate"); }
+  if (!converter) { GST_ERROR("failed to create videoconvert"); }
+  if (!queue1) { GST_ERROR("failed to create upstream-queue"); }
+  if (!encoder) { GST_ERROR("failed to create encoder"); }
   if (!app->queue2) { GST_ERROR("failed to create ringbuffer-queue"); }
 
-  if (!app->pipeline ||
-      !app->source ||
-      !app->caps ||
-      !app->videorate ||
-      !app->converter ||
-      !app->queue1 ||
-      !app->encoder ||
-      !app->queue2 ||
-      !app->bin) {
+  if (!app->pipeline || !source || !filter || !videorate || !converter ||
+      !queue1 || !encoder || !app->queue2 || !app->bin) {
     GST_ERROR ("An element could not be created. Exiting.");
     return -1;
   }
 
-#define GST_QUEUE_LEAK_DOWNSTREAM 2
-  g_object_set (app->source, "is-live", TRUE, NULL);
-  g_object_set (app->source, "pattern", 18, NULL);
+  g_object_set (source, "is-live", TRUE, NULL);
+  g_object_set (source, "pattern", 18, NULL);
+  g_object_set (encoder, "byte-stream", TRUE, NULL);
+  g_object_set (encoder, "key-int-max", 30, NULL);
   g_object_set (app->queue2,
       "leaky", GST_QUEUE_LEAK_DOWNSTREAM,
       "max-size-bytes", 500 * 1024 * 1024,
       "max-size-buffers", 0,
       "max-size-time", 0,
       NULL);
-  g_object_set (app->encoder, "byte-stream", TRUE, NULL);
-  g_object_set (app->encoder, "key-int-max", 30, NULL);
 
-  GstCaps *caps;
-  caps = gst_caps_new_simple ("video/x-raw",
+  GstCaps * caps = gst_caps_new_simple ("video/x-raw",
       "format", G_TYPE_STRING, "I420",
       "framerate", GST_TYPE_FRACTION, 30, 1,
       "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
@@ -507,7 +481,7 @@ main (int   argc,
       "height", G_TYPE_INT, 1080,
       NULL);
 
-  g_object_set (app->caps, "caps", caps, NULL);
+  g_object_set (filter, "caps", caps, NULL);
 
   /* Add a message handler */
   bus = gst_pipeline_get_bus (GST_PIPELINE (app->pipeline));
@@ -516,11 +490,10 @@ main (int   argc,
 
   /* Add elements up to the second queue -- the "fixed" part of the pipeline */
   gst_bin_add_many (GST_BIN (app->pipeline),
-      app->source, app->caps, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
+      source, filter, videorate, converter, queue1, encoder, app->queue2, app->bin, NULL);
 
   /* we link the elements together */
-  gst_element_link_many (
-      app->source, app->caps, app->videorate, app->converter, app->queue1, app->encoder, app->queue2, app->bin, NULL);
+  gst_element_link_many (source, filter, videorate, converter, queue1, encoder, app->queue2, app->bin, NULL);
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
 
