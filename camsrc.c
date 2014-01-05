@@ -40,7 +40,32 @@ typedef struct {
 GST_DEBUG_CATEGORY_STATIC (camsrc);
 #define GST_CAT_DEFAULT camsrc
 
-void drop_bin (App * app)
+static GstElement * create_bin (char * output_location, App * app)
+{
+  GST_LOG ("Saving stream to %s...", output_location);
+
+  GstElement *bin = gst_element_factory_make ("bin", NULL),
+             *mux = gst_element_factory_make ("mp4mux", "mux"),
+             *sink = gst_element_factory_make ("filesink", "sink");
+
+  if (!bin) { GST_ERROR("Failed to create bin"); }
+  if (!mux) { GST_ERROR("Failed to create mux"); }
+  if (!sink) { GST_ERROR("Failed to create sink"); }
+
+  if (!bin || !mux || !sink) {
+    return NULL;
+  }
+
+  g_object_set (sink, "location", output_location, NULL);
+
+  gst_bin_add_many (GST_BIN (bin), mux, sink, NULL);
+  gst_element_link (mux, sink);
+  gst_element_add_pad(bin, gst_ghost_pad_new ("sink", gst_element_get_request_pad (mux, "video_%u")));
+
+  return bin;
+}
+
+static void drop_bin (App * app)
 {
   gst_element_set_state (app->bin, GST_STATE_NULL);
   gst_bin_remove (GST_BIN(app->pipeline), app->bin);
@@ -55,9 +80,11 @@ static void hangup (App * app)
   }
 }
 
-gint get_file_descriptor (App * app)
+static gint get_file_descriptor (App * app)
 {
-  gint fd = app->connection ? g_socket_get_fd (g_socket_connection_get_socket (app->connection)) : g_open ("/dev/null", O_WRONLY, 0);
+  gint fd = app->connection ?
+    g_socket_get_fd (g_socket_connection_get_socket (app->connection)) :
+    g_open ("/dev/null", O_WRONLY, 0);
   return fd;
 }
 
@@ -86,70 +113,6 @@ static void send_result_to_socket (App * app)
   g_free (app->file_location);
 }
 
-static gboolean
-bus_call (GstBus     *bus,
-    GstMessage *msg,
-    gpointer    data)
-{
-  App * app = data;
-
-  switch (GST_MESSAGE_TYPE (msg)) {
-
-    case GST_MESSAGE_EOS:
-      GST_LOG ("Finished writing stream");
-      send_result_to_socket (app);
-      drop_bin (app);
-      hangup (app);
-      break;
-
-    case GST_MESSAGE_ERROR:
-      {
-        gchar  *debug;
-        GError *error;
-
-        gst_message_parse_error (msg, &error, &debug);
-
-        GST_ERROR ("Error: %s", error->message);
-        g_error_free (error);
-
-        GST_ERROR ("Debugging info: %s", (debug) ? debug : "none");
-        g_free (debug);
-
-        g_main_loop_quit (app->loop);
-        break;
-      }
-    default:
-      break;
-  }
-
-  return TRUE;
-}
-
-GstElement * create_bin (char * output_location, App * app)
-{
-  GST_LOG ("Saving stream to %s...", output_location);
-
-  GstElement *bin = gst_element_factory_make ("bin", NULL),
-             *mux = gst_element_factory_make ("mp4mux", "mux"),
-             *sink = gst_element_factory_make ("filesink", "sink");
-
-  if (!bin) { GST_ERROR("Failed to create bin"); }
-  if (!mux) { GST_ERROR("Failed to create mux"); }
-  if (!sink) { GST_ERROR("Failed to create sink"); }
-
-  if (!bin || !mux || !sink) {
-    return NULL;
-  }
-
-  g_object_set (sink, "location", output_location, NULL);
-
-  gst_bin_add_many (GST_BIN (bin), mux, sink, NULL);
-  gst_element_link (mux, sink);
-  gst_element_add_pad(bin, gst_ghost_pad_new ("sink", gst_element_get_request_pad (mux, "video_%u")));
-
-  return bin;
-}
-
 static GstPadProbeReturn
 blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
@@ -165,7 +128,7 @@ blockpad_probe_cb (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   return GST_PAD_PROBE_OK;
 }
 
-void block_pipeline(App *app)
+static void block_pipeline(App *app)
 {
   app->blockpad_probe_id = gst_pad_add_probe (app->blockpad,
       GST_PAD_PROBE_TYPE_BLOCK | GST_PAD_PROBE_TYPE_BUFFER,
@@ -211,7 +174,6 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
       break;
   }
 
-
   gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
   block_pipeline(app);
 
@@ -251,7 +213,7 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 }
 
 
-void unblock_pipeline(App *app)
+static void unblock_pipeline(App *app)
 {
   app->bin = create_bin (app->file_location, app);
   gst_bin_add (GST_BIN(app->pipeline), app->bin);
@@ -373,7 +335,7 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
   return TRUE;
 }
 
-gboolean
+static gboolean
 incoming_callback  (GSocketService *service,
                     GSocketConnection *connection,
                     GObject *source_object,
@@ -390,6 +352,43 @@ incoming_callback  (GSocketService *service,
   app->socket_watcher_id = g_io_add_watch (channel, G_IO_IN, (GIOFunc) io_callback, app);
   g_io_channel_set_encoding (channel, NULL, &error);
   g_io_channel_set_close_on_unref (channel, TRUE);
+  return TRUE;
+}
+
+static gboolean
+bus_call (GstBus *bus, GstMessage *msg, gpointer data)
+{
+  App * app = data;
+
+  switch (GST_MESSAGE_TYPE (msg)) {
+
+    case GST_MESSAGE_EOS:
+      GST_LOG ("Finished writing stream to %s", app->file_location);
+      send_result_to_socket (app);
+      drop_bin (app);
+      hangup (app);
+      break;
+
+    case GST_MESSAGE_ERROR:
+      {
+        gchar  *debug;
+        GError *error;
+
+        gst_message_parse_error (msg, &error, &debug);
+
+        GST_ERROR ("Error: %s", error->message);
+        g_error_free (error);
+
+        GST_ERROR ("Debugging info: %s", (debug) ? debug : "none");
+        g_free (debug);
+
+        g_main_loop_quit (app->loop);
+        break;
+      }
+    default:
+      break;
+  }
+
   return TRUE;
 }
 
