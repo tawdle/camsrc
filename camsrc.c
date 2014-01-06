@@ -33,7 +33,7 @@ typedef struct {
   GstClockTime clock_desired_duration;
   GSocketConnection * connection;
   guint socket_watcher_id;
-  gchar * file_location;
+  gchar file_location[1024];
 } App;
 
 typedef enum {
@@ -48,9 +48,24 @@ typedef enum {
 GST_DEBUG_CATEGORY_STATIC (camsrc);
 #define GST_CAT_DEFAULT camsrc
 
-static GstElement * create_bin (char * output_location, App * app)
+gboolean mkpath(gchar* file_path, mode_t mode) {
+  if (!file_path || !*file_path)
+    return FALSE;
+
+  gchar* p;
+  for (p = strchr(file_path + 1, '/'); p; p = strchr(p + 1, '/')) {
+    *p= '\0';
+    if (mkdir(file_path, mode) == -1) {
+      if (errno != EEXIST) { perror(file_path); *p='/'; return FALSE; }
+    }
+    *p = '/';
+  }
+  return TRUE;
+}
+
+static GstElement * create_bin (App * app)
 {
-  GST_LOG ("Saving stream to %s...", output_location);
+  GST_LOG ("Saving stream to %s...", app->file_location);
 
   GstElement *bin = gst_element_factory_make ("bin", NULL),
              *mux = gst_element_factory_make ("mp4mux", "mux"),
@@ -64,7 +79,11 @@ static GstElement * create_bin (char * output_location, App * app)
     return NULL;
   }
 
-  g_object_set (sink, "location", output_location, NULL);
+  if (!mkpath(app->file_location, 0766)) {
+    GST_ERROR ("mkpath of '%s' failed", app->file_location);
+  }
+
+  g_object_set (sink, "location", app->file_location, NULL);
 
   gst_bin_add_many (GST_BIN (bin), mux, sink, NULL);
   gst_element_link (mux, sink);
@@ -96,29 +115,47 @@ static gint get_file_descriptor (App * app)
   return fd;
 }
 
+static gboolean socket_send_string (gchar * str, App * app)
+{
+  if (!app->connection || !str)
+    return FALSE;
+
+  ssize_t sent;
+  guint len = strlen(str);
+  gint dest = get_file_descriptor (app);
+
+  if ((sent = write (dest, str, len)) < len) {
+    GST_ERROR ("entire response didn't get sent (only %zd bytes of %u).", sent, len);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 static void send_result_to_socket (App * app)
 {
-  gint src, dest = get_file_descriptor (app);
+  gint src;
   struct stat stat_buf;
   gchar response[1024];
-  ssize_t sent;
-
-  if (!app->connection) return;
 
   src = g_open (app->file_location, O_RDONLY);
   fstat (src, &stat_buf);
   close (src);
 
   g_snprintf (response, sizeof(response),
-      "{ \"content-type\": \"video/mp4\", \"content-length\": %lld, \"location\": \"%s\" }\n",
+      "{ \"status\": 200, \"content-type\": \"video/mp4\", \"content-length\": %lld, \"location\": \"%s\" }\n",
       stat_buf.st_size, app->file_location);
 
-  if ((sent = write (dest, response, strlen(response))) < strlen(response)) {
-    GST_ERROR ("whoops! entire header didn't get sent (only %zd bytes of %lu).", sent, strlen(response));
-  }
+  socket_send_string (response, app);
+}
 
-  /* clean up and exit */
-  g_free (app->file_location);
+static void send_error_to_socket (guint status, gchar * reason, App *app)
+{
+  gchar response[1024];
+
+  g_snprintf (response, sizeof(response),
+      "{ \"status\": %u, \"reason\": \"%s\" }", status, reason);
+
+  socket_send_string (response, app);
 }
 
 static GstPadProbeReturn
@@ -219,7 +256,7 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 
 static void unblock_pipeline(App *app)
 {
-  app->bin = create_bin (app->file_location, app);
+  app->bin = create_bin (app);
   gst_bin_add (GST_BIN(app->pipeline), app->bin);
   gst_element_link (app->queue2, app->bin);
   gst_element_set_state (app->bin, GST_STATE_PLAYING);
@@ -281,15 +318,29 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         return FALSE;
 
       } else if (g_str_has_prefix(buffer->str, "replay ")) {
-        glong start;
-        glong duration;
+        glong start = 0;
+        glong duration = 0;
         gchar * next = &buffer->str[7];
         gchar * filepath;
+        gboolean valid = TRUE;
 
         // Parse out params: start duration filepath
         start = strtol(next, &next, 10);
+        if (!start && errno == EINVAL)
+          valid = FALSE;
         duration = strtol(next, &next, 10);
+        if (duration <= 0)
+          valid = FALSE;
         filepath = g_strstrip(next);
+        if (filepath[0] != '/')
+          valid = FALSE;
+
+        if (!valid) {
+          GST_WARNING ("command parameters invalid");
+          send_error_to_socket (400, "couldn't parse request", app);
+          hangup (app);
+          return FALSE;
+        }
 
         // Convert incoming times from msec to nsec
         start = start * GST_MSECOND;
@@ -310,7 +361,15 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         app->clock_start = start;
         app->clock_desired_duration = duration;
         app->clock_end = start + duration;
-        app->file_location = strdup(filepath);
+        strcpy(app->file_location, filepath);
+
+        // May not request clips from the future
+        if (app->clock_start > get_current_time() || app->clock_end > get_current_time()) {
+          GST_WARNING ("command parameters invalid");
+          send_error_to_socket (416, "invalid time range requested", app);
+          hangup (app);
+          return FALSE;
+        }
 
         unblock_pipeline(app);
       } else {
@@ -429,6 +488,7 @@ main (int argc, char *argv[])
   app->loop = g_main_loop_new (NULL, FALSE);
   app->blockpad_probe_id = 0;
   app->connection = NULL;
+  strcpy(app->file_location, "/dev/null");
 
   /* Create gstreamer elements */
   app->pipeline          = gst_pipeline_new ("camsrc");
@@ -441,7 +501,7 @@ main (int argc, char *argv[])
              * encoder   = gst_element_factory_make ("x264enc", "video-encoder");
 
   app->queue2            = gst_element_factory_make ("queue", "ringbuffer-queue");
-  app->bin               = create_bin ("/dev/null", app);
+  app->bin               = create_bin (app);
 
   if (!app->pipeline) { GST_ERROR ("Failed to create pipeline"); }
   if (!source) { GST_ERROR("failed to create videotestsrc"); }
