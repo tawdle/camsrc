@@ -26,7 +26,9 @@ typedef struct {
   GstElement *queue2;
   GstElement *bin;
   GstPad * blockpad;
+  GstPad * srcpad;
   gulong blockpad_probe_id;
+  gulong srcpad_probe_id;
   GstClockTime base_time;
   GstClockTime clock_start;
   GstClockTime clock_end;
@@ -48,6 +50,33 @@ typedef enum {
 GST_DEBUG_CATEGORY_STATIC (camsrc);
 #define GST_CAT_DEFAULT camsrc
 
+static gchar * get_buffer_status(gchar * buff, App * app)
+{
+  GstClockTime level_time_1;
+  GstClockTime level_time_2;
+  guint level_bytes_1, level_buffers_1;
+  guint level_bytes_2, level_buffers_2;
+
+  g_object_get (gst_bin_get_by_name (GST_BIN (app->pipeline), "upstream-queue"),
+      "current-level-time", &level_time_1,
+      "current-level-bytes", &level_bytes_1,
+      "current-level-buffers", &level_buffers_1, NULL);
+
+  g_object_get (app->queue2,
+      "current-level-time", &level_time_2,
+      "current-level-bytes", &level_bytes_2,
+      "current-level-buffers", &level_buffers_2, NULL);
+
+  g_snprintf(buff, 1024,
+      "queue1 reports %lums, %u buffers, %u bytes "
+      "queue2 reports %lums, %u buffers, %u bytes\n",
+      GST_TIME_AS_MSECONDS(level_time_1), level_buffers_1, level_bytes_1,
+      GST_TIME_AS_MSECONDS(level_time_2), level_buffers_2, level_bytes_2);
+
+  return buff;
+}
+
+
 gboolean mkpath(gchar* file_path, mode_t mode) {
   if (!file_path || !*file_path)
     return FALSE;
@@ -65,7 +94,7 @@ gboolean mkpath(gchar* file_path, mode_t mode) {
 
 static GstElement * create_bin (App * app)
 {
-  GST_LOG ("Saving stream to %s...", app->file_location);
+  GST_DEBUG ("Saving stream to %s...", app->file_location);
 
   GstElement *bin = gst_element_factory_make ("bin", NULL),
              *mux = gst_element_factory_make ("mp4mux", "mux"),
@@ -190,7 +219,7 @@ static WindowReturn inside_window(GstPadProbeInfo * info, App * app)
     WINDOW_INSIDE_KEYFRAME : WINDOW_INSIDE;
 
   if (have_keyframe)
-    GST_DEBUG ("pts check : %lu%s %s [%lu, %lu]", GST_TIME_AS_MSECONDS(pts), have_keyframe ? "*" : "",
+    GST_LOG ("pts check : %lu%s %s [%lu, %lu]", GST_TIME_AS_MSECONDS(pts), have_keyframe ? "*" : "",
         ret == WINDOW_BEFORE ? "before" : ret == WINDOW_AFTER ? "after" : "inside",
         GST_TIME_AS_MSECONDS(app->clock_start), GST_TIME_AS_MSECONDS(app->clock_end));
 
@@ -210,7 +239,7 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 
     case WINDOW_INSIDE:
     case WINDOW_INSIDE_KEYFRAME:
-      GST_DEBUG ("Passing along a frame that is in window");
+      GST_LOG ("Passing along a frame that is in window");
       return GST_PAD_PROBE_PASS;
 
     case WINDOW_AFTER:
@@ -218,9 +247,10 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
   }
 
   gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
+
   block_pipeline(app);
 
-  return GST_PAD_PROBE_DROP;
+  return GST_PAD_PROBE_PASS;
 }
 
 
@@ -231,11 +261,11 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 
   switch (inside_window(info, app)) {
     case WINDOW_BEFORE:
-      GST_DEBUG ("Dropping a frame that is too old");
+      GST_LOG ("Dropping a frame that is too old");
       return GST_PAD_PROBE_DROP;
 
     case WINDOW_INSIDE:
-      GST_DEBUG ("Dropping non-keyframe");
+      GST_LOG ("Dropping non-keyframe");
       return GST_PAD_PROBE_DROP;
 
     case WINDOW_INSIDE_KEYFRAME:
@@ -254,8 +284,35 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
 }
 
 
+static GstPadProbeReturn
+drop_query_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  GstQuery * query = gst_pad_probe_info_get_query (info);
+
+  GST_DEBUG ("Received query of type '%s'", GST_QUERY_TYPE_NAME (query));
+
+  if (GST_QUERY_TYPE (query) == GST_QUERY_ALLOCATION) {
+    GST_DEBUG ("Dropping query");
+    return GST_PAD_PROBE_DROP;
+  } else {
+    GST_DEBUG ("Passing query");
+    return GST_PAD_PROBE_OK;
+  }
+
+}
+
 static void unblock_pipeline(App *app)
 {
+  // Need to prevent the source from sending an allocation query
+  // because it will hang the upstream pipeline.
+  // This gets added once (must happen after the initial caps
+  // negotiation) and left in place forever.
+  if (!app->srcpad_probe_id) {
+    GST_DEBUG ("Adding srcpad_probe");
+    app->srcpad_probe_id =  gst_pad_add_probe (app->srcpad,
+        GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM, drop_query_cb, app, NULL);
+  }
+
   app->bin = create_bin (app);
   gst_bin_add (GST_BIN(app->pipeline), app->bin);
   gst_element_link (app->queue2, app->bin);
@@ -291,28 +348,17 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
       g_strstrip(buffer->str);
       if (!strcmp (buffer->str, ""))
         break;
-      GST_LOG("received command %s", buffer->str);
+      GST_DEBUG("received command %s", buffer->str);
       if (!strcmp("shutdown", buffer->str)) {
         g_main_loop_quit (app->loop);
         hangup (app);
         return FALSE;
 
       } else if (!strcmp("query", buffer->str)) {
-        GstClockTime level_time_2;
-        guint level_bytes_2, level_buffers_2;
-        char buff[1024];
         gsize bytes_written;
+        char buff[1024];
 
-        g_object_get (app->queue2,
-            "current-level-time", &level_time_2,
-            "current-level-bytes", &level_bytes_2,
-            "current-level-buffers", &level_buffers_2, NULL);
-
-        g_snprintf(buff, 1024,
-            "queue2 reports %lums, %u buffers, %u bytes\n",
-            GST_TIME_AS_MSECONDS(level_time_2), level_buffers_2, level_bytes_2);
-
-        g_io_channel_write_chars (source, buff, -1, &bytes_written, &error);
+        g_io_channel_write_chars (source, get_buffer_status (buff, app), -1, &bytes_written, &error);
         g_io_channel_flush (source, &error);
         hangup (app);
         return FALSE;
@@ -402,7 +448,7 @@ incoming_callback  (GSocketService *service,
   GError * error = NULL;
   App * app = user_data;
 
-  GST_LOG ("Received connection from client");
+  GST_DEBUG ("Received connection from client");
   g_object_ref (connection);
   app->connection = connection;
 
@@ -417,11 +463,13 @@ static gboolean
 bus_call (GstBus *bus, GstMessage *msg, gpointer data)
 {
   App * app = data;
+  gchar buffer[1024];
 
   switch (GST_MESSAGE_TYPE (msg)) {
 
     case GST_MESSAGE_EOS:
-      GST_LOG ("Finished writing stream to %s", app->file_location);
+      GST_DEBUG ("Finished writing stream to %s", app->file_location);
+      GST_DEBUG ("buffer status is now: %s", get_buffer_status (buffer, app));
       send_result_to_socket (app);
       drop_bin (app);
       hangup (app);
@@ -487,6 +535,7 @@ main (int argc, char *argv[])
 
   app->loop = g_main_loop_new (NULL, FALSE);
   app->blockpad_probe_id = 0;
+  app->srcpad_probe_id = 0;
   app->connection = NULL;
   strcpy(app->file_location, "/dev/null");
 
@@ -519,7 +568,7 @@ main (int argc, char *argv[])
   }
 
   g_object_set (source, "is-live", TRUE, NULL);
-  g_object_set (source, "pattern", 18, NULL);
+  /*g_object_set (source, "pattern", 18, NULL);*/
   g_object_set (encoder, "byte-stream", TRUE, NULL);
   g_object_set (encoder, "key-int-max", 30, NULL);
   g_object_set (app->queue2,
@@ -545,11 +594,12 @@ main (int argc, char *argv[])
   gst_object_unref (bus);
 
   gst_bin_add_many (GST_BIN (app->pipeline),
-      source, filter, videorate, converter, queue1, encoder, app->queue2, app->bin, NULL);
+      source, filter, /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
 
-  gst_element_link_many (source, filter, videorate, converter, queue1, encoder, app->queue2, app->bin, NULL);
+  gst_element_link_many (source, filter, /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
+  app->srcpad   = gst_element_get_static_pad (encoder, "src");
 
   block_pipeline(app);
 
