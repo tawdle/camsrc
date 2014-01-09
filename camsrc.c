@@ -573,6 +573,7 @@ main (int argc, char *argv[])
     g_object_set (source,
         "device-number", device_number,
         "connection", 0,
+        "mode", "1080p30",
         NULL);
   }
 
