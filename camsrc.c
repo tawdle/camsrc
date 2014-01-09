@@ -567,15 +567,13 @@ main (int argc, char *argv[])
     return -1;
   }
 
-  g_object_set (source, "is-live", TRUE, NULL);
-  /*g_object_set (source, "pattern", 18, NULL);*/
   g_object_set (encoder, "byte-stream", TRUE, NULL);
   g_object_set (encoder, "key-int-max", 30, NULL);
   g_object_set (app->queue2,
       "leaky", GST_QUEUE_LEAK_DOWNSTREAM,
-      "max-size-bytes", 500 * 1024 * 1024,
+      "max-size-bytes", 0,
       "max-size-buffers", 0,
-      "max-size-time", 0,
+      "max-size-time", 5 * 60 * GST_SECOND,
       NULL);
 
   GstCaps * caps = gst_caps_new_simple ("video/x-raw",
