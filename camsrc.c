@@ -567,7 +567,10 @@ main (int argc, char *argv[])
     /*g_object_set (source, "pattern", 18, NULL);*/
   } else {
     source = gst_element_factory_make ("decklinksrc", "video-source");
-    g_object_set (source, "device-number", device_number, NULL);
+    g_object_set (source,
+        "device-number", device_number,
+        "connection", 0,
+        NULL);
   }
 
   if (!app->pipeline) { GST_ERROR ("Failed to create pipeline"); }
