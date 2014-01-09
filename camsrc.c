@@ -171,8 +171,8 @@ static void send_result_to_socket (App * app)
   close (src);
 
   g_snprintf (response, sizeof(response),
-      "{ \"status\": 200, \"content-type\": \"video/mp4\", \"content-length\": %lld, \"location\": \"%s\" }\n",
-      stat_buf.st_size, app->file_location);
+      "{ \"status\": 200, \"content-type\": \"video/mp4\", \"content-length\": %ld, \"location\": \"%s\" }\n",
+      (glong)stat_buf.st_size, app->file_location);
 
   socket_send_string (response, app);
 }
@@ -280,6 +280,9 @@ wait_for_start_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
       gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
       block_pipeline(app);
       return GST_PAD_PROBE_DROP;
+
+    default:
+      return GST_PAD_PROBE_OK;  // should never reach here
   }
 }
 
@@ -527,7 +530,7 @@ main (int argc, char *argv[])
   g_socket_listener_add_inet_port ((GSocketListener*)service, port, NULL, &error);
 
   if (error) {
-    g_error (error->message);
+    g_error ("error setting up socket %s", error->message);
   }
 
   g_signal_connect (service, "incoming", G_CALLBACK (incoming_callback), app);
