@@ -3,6 +3,7 @@
  * * protect against multiple overlapping requests
  * * on startup, choose a camera
  * * adjust start time to account for keyframes
+ * * record last PTS seen and use that as a lower bound for acceptable request start-time
  * */
 
 #include <gst/gst.h>
@@ -18,6 +19,7 @@
 #include <sys/uio.h>
 
 #define PORT 2000
+#define DEVICE_NUMBER_TEST -1
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
 
 typedef struct {
@@ -510,10 +512,11 @@ main (int argc, char *argv[])
   App * app = &app_data;
   GOptionContext * option_context;
   GError * error = NULL;
-  gint port = PORT;
+  gint port = -1, device_number = DEVICE_NUMBER_TEST;
 
   GOptionEntry option_entries[] = {
     { "port", 'p', 0, G_OPTION_ARG_INT, &port, "Port to listen on (default 2000)", "PORT" },
+    { "device-number", 'd', 0, G_OPTION_ARG_INT, &device_number, "Camera to use", "DEVICE_NUMBER" },
     { NULL }
   };
 
@@ -524,6 +527,12 @@ main (int argc, char *argv[])
   g_option_context_add_main_entries (option_context, option_entries, NULL);
   g_option_context_parse (option_context, &argc, &argv, &error);
   g_option_context_free (option_context);
+
+  // If no port specified, we use PORT + device_number (unless we're also testing,
+  // in which case we just use PORT).
+  if (port < 0) {
+    port = device_number == DEVICE_NUMBER_TEST ? PORT : PORT + device_number;
+  }
 
   /* set up socket */
   GSocketService * service = g_socket_service_new ();
@@ -545,7 +554,7 @@ main (int argc, char *argv[])
   /* Create gstreamer elements */
   app->pipeline          = gst_pipeline_new ("camsrc");
 
-  GstElement * source    = gst_element_factory_make ("videotestsrc", "video-source"),
+  GstElement * source,
              * filter    = gst_element_factory_make ("capsfilter", "caps-filter"),
              * videorate = gst_element_factory_make ("videorate", "video-rate"),
              * converter = gst_element_factory_make ("videoconvert", "video-convert"),
@@ -554,6 +563,15 @@ main (int argc, char *argv[])
 
   app->queue2            = gst_element_factory_make ("queue", "ringbuffer-queue");
   app->bin               = create_bin (app);
+
+  if (device_number == DEVICE_NUMBER_TEST) {
+    source = gst_element_factory_make ("videotestsrc", "video-source");
+    g_object_set (source, "is-live", TRUE, NULL);
+    /*g_object_set (source, "pattern", 18, NULL);*/
+  } else {
+    source = gst_element_factory_make ("decklinksrc", "video-source");
+    g_object_set (source, "device-number", device_number, NULL);
+  }
 
   if (!app->pipeline) { GST_ERROR ("Failed to create pipeline"); }
   if (!source) { GST_ERROR("failed to create videotestsrc"); }
@@ -570,15 +588,13 @@ main (int argc, char *argv[])
     return -1;
   }
 
-  g_object_set (source, "is-live", TRUE, NULL);
-  /*g_object_set (source, "pattern", 18, NULL);*/
   g_object_set (encoder, "byte-stream", TRUE, NULL);
   g_object_set (encoder, "key-int-max", 30, NULL);
   g_object_set (app->queue2,
       "leaky", GST_QUEUE_LEAK_DOWNSTREAM,
-      "max-size-bytes", 500 * 1024 * 1024,
+      "max-size-bytes", 0,
       "max-size-buffers", 0,
-      "max-size-time", 0,
+      "max-size-time", 5 * 60 * GST_SECOND,
       NULL);
 
   GstCaps * caps = gst_caps_new_simple ("video/x-raw",
