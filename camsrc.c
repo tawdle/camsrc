@@ -21,6 +21,7 @@
 #define PORT 2000
 #define DEVICE_NUMBER_TEST -1
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
+#define DECKLINK_MODE_1080_30_P 9
 
 typedef struct {
   GMainLoop  *loop;
@@ -570,7 +571,7 @@ main (int argc, char *argv[])
     g_object_set (source,
         "device-number", device_number,
         "connection", 0,
-        "mode", "1080p30",
+        "mode", DECKLINK_MODE_1080_30_P,
         NULL);
   }
 
