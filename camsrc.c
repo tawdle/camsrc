@@ -614,11 +614,12 @@ main (int argc, char *argv[])
       NULL);
 
   GstCaps * caps = gst_caps_new_simple ("video/x-raw",
-      "format", G_TYPE_STRING, "I420",
-      "framerate", GST_TYPE_FRACTION, 30, 1,
-      "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
       "width", G_TYPE_INT, 1920,
       "height", G_TYPE_INT, 1080,
+      "framerate", GST_TYPE_FRACTION, 30, 1,
+      "format", G_TYPE_STRING, "I420",
+      "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
+      "interlace-model", G_TYPE_STRING, "progressive",
       NULL);
 
   g_object_set (filter, "caps", caps, NULL);
