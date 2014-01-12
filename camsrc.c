@@ -628,7 +628,7 @@ main (int argc, char *argv[])
   gst_object_unref (bus);
 
   gst_bin_add_many (GST_BIN (app->pipeline),
-      source, /* filter, */ /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
+      source, /* videorate, */ converter, filter, queue1, encoder, app->queue2, app->bin, NULL);
 
   gst_element_link_many (source, /* videorate, */ converter, filter, queue1, encoder, app->queue2, app->bin, NULL);
 
