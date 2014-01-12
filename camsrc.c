@@ -619,7 +619,7 @@ main (int argc, char *argv[])
       "framerate", GST_TYPE_FRACTION, 30, 1,
       "format", G_TYPE_STRING, "I420",
       "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1,
-      "interlace-model", G_TYPE_STRING, "progressive",
+      "interlace-mode", G_TYPE_STRING, "progressive",
       NULL);
 
   g_object_set (filter, "caps", caps, NULL);
