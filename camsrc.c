@@ -22,6 +22,8 @@
 #define DEVICE_NUMBER_TEST -1
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
 #define DECKLINK_MODE_1080_30_P 9
+#define X264_SPEED_PRESET_DEFAULT 4
+#define VERBOSE_DEFAULT FALSE
 
 typedef struct {
   GMainLoop  *loop;
@@ -513,11 +515,16 @@ main (int argc, char *argv[])
   App * app = &app_data;
   GOptionContext * option_context;
   GError * error = NULL;
-  gint port = -1, device_number = DEVICE_NUMBER_TEST;
+  gint port = -1,
+       device_number = DEVICE_NUMBER_TEST,
+       speed_preset = X264_SPEED_PRESET_DEFAULT;
+  gboolean verbose = VERBOSE_DEFAULT;
 
   GOptionEntry option_entries[] = {
     { "port", 'p', 0, G_OPTION_ARG_INT, &port, "Port to listen on (default 2000)", "PORT" },
     { "device-number", 'd', 0, G_OPTION_ARG_INT, &device_number, "Camera to use", "DEVICE_NUMBER" },
+    { "speed-preset", 's', 0, G_OPTION_ARG_INT, &speed_preset, "x264 speed preset" },
+    { "verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose, "Verbose (shows caps negotiation)" },
     { NULL }
   };
 
@@ -593,8 +600,11 @@ main (int argc, char *argv[])
     return -1;
   }
 
-  g_object_set (encoder, "byte-stream", TRUE, NULL);
-  g_object_set (encoder, "key-int-max", 30, NULL);
+  g_object_set (encoder,
+      "key-int-max", 30,
+      "speed-preset", speed_preset,
+      NULL);
+
   g_object_set (app->queue2,
       "leaky", GST_QUEUE_LEAK_DOWNSTREAM,
       "max-size-bytes", 0,
@@ -618,18 +628,20 @@ main (int argc, char *argv[])
   gst_object_unref (bus);
 
   gst_bin_add_many (GST_BIN (app->pipeline),
-      source, filter, /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
+      source, /* filter, */ /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
 
-  gst_element_link_many (source, filter, /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
+  gst_element_link_many (source, /* filter, */ /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
   app->srcpad   = gst_element_get_static_pad (encoder, "src");
 
   block_pipeline(app);
 
-   /*Verbose*/
-  /*g_signal_connect (app->pipeline, "deep-notify",*/
-    /*G_CALLBACK (gst_object_default_deep_notify), NULL);*/
+  /*Verbose*/
+  if (verbose) {
+    g_signal_connect (app->pipeline, "deep-notify",
+      G_CALLBACK (gst_object_default_deep_notify), NULL);
+  }
 
   /* Set the pipeline to "playing" state */
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
