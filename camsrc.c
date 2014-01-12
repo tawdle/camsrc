@@ -630,7 +630,7 @@ main (int argc, char *argv[])
   gst_bin_add_many (GST_BIN (app->pipeline),
       source, /* filter, */ /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
 
-  gst_element_link_many (source, /* filter, */ /* videorate, */ converter, queue1, encoder, app->queue2, app->bin, NULL);
+  gst_element_link_many (source, /* videorate, */ converter, filter, queue1, encoder, app->queue2, app->bin, NULL);
 
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
   app->srcpad   = gst_element_get_static_pad (encoder, "src");
