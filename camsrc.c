@@ -117,7 +117,7 @@ static GstElement * create_bin (App * app)
     GST_ERROR ("mkpath of '%s' failed", app->file_location);
   }
 
-  g_object_set (mux, "faststart", TRUE, NULL);
+  // g_object_set (mux, "faststart", TRUE, NULL);
   g_object_set (sink, "location", app->file_location, NULL);
 
   gst_bin_add_many (GST_BIN (bin), mux, sink, NULL);
