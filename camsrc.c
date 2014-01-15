@@ -22,8 +22,9 @@
 #define DEVICE_NUMBER_TEST -1
 #define GST_QUEUE_LEAK_DOWNSTREAM 2
 #define DECKLINK_MODE_1080_30_P 9
-#define X264_SPEED_PRESET_DEFAULT 4
+#define X264_SPEED_PRESET_DEFAULT 3
 #define VERBOSE_DEFAULT FALSE
+#define BITRATE_DEFAULT 5000
 
 typedef struct {
   GMainLoop  *loop;
@@ -518,6 +519,7 @@ main (int argc, char *argv[])
   GError * error = NULL;
   gint port = -1,
        device_number = DEVICE_NUMBER_TEST,
+       bitrate = BITRATE_DEFAULT,
        speed_preset = X264_SPEED_PRESET_DEFAULT;
   gboolean verbose = VERBOSE_DEFAULT;
 
@@ -525,6 +527,7 @@ main (int argc, char *argv[])
     { "port", 'p', 0, G_OPTION_ARG_INT, &port, "Port to listen on (default 2000)", "PORT" },
     { "device-number", 'd', 0, G_OPTION_ARG_INT, &device_number, "Camera to use", "DEVICE_NUMBER" },
     { "speed-preset", 's', 0, G_OPTION_ARG_INT, &speed_preset, "x264 speed preset" },
+    { "bitrate", 's', 0, G_OPTION_ARG_INT, &bitrate, "x264 bitrate" },
     { "verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose, "Verbose (shows caps negotiation)" },
     { NULL }
   };
@@ -604,6 +607,7 @@ main (int argc, char *argv[])
   g_object_set (encoder,
       "key-int-max", 30,
       "speed-preset", speed_preset,
+      "bitrate", bitrate,
       NULL);
 
   g_object_set (app->queue2,
@@ -650,6 +654,9 @@ main (int argc, char *argv[])
 
   app->base_time = get_current_time();
 
+  g_printf ("device-number: %d\n", device_number);
+  g_printf ("speed-preset: %d\n", speed_preset);
+  g_printf ("bitrate: %d\n", bitrate);
   g_printf ("camsrc listening on port %d...\n", port);
 
   g_main_loop_run (app->loop);
