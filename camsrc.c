@@ -648,7 +648,7 @@ main (int argc, char *argv[])
   app->srcpad   = gst_element_get_static_pad (encoder, "src");
 
   // Set timestamps on buffers coming out of source
-  gst_pad_add_probe (gst_element_get_static_pad (source, "src"),
+  gst_pad_add_probe (gst_element_get_static_pad (source, device_number == DEVICE_NUMBER_TEST ? "src" : "videosrc"),
       GST_PAD_PROBE_TYPE_BUFFER, source_set_timestamps, app, NULL);
 
   block_pipeline(app);
