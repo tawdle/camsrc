@@ -35,7 +35,6 @@ typedef struct {
   GstPad * srcpad;
   gulong blockpad_probe_id;
   gulong srcpad_probe_id;
-  GstClockTime base_time;
   GstClockTime clock_start;
   GstClockTime clock_end;
   GstClockTime clock_desired_duration;
@@ -253,6 +252,8 @@ wait_for_end_cb (GstPad * pad, GstPadProbeInfo * info, gpointer data)
       break;
   }
 
+  GST_LOG ("Capping flow");
+
   gst_pad_remove_probe (pad, GST_PAD_PROBE_INFO_ID (info));
 
   block_pipeline(app);
@@ -347,6 +348,16 @@ static GstClockTime get_current_time()
   return GST_TIMEVAL_TO_TIME (current_time);
 }
 
+static GstPadProbeReturn
+source_set_timestamps (GstPad * pad, GstPadProbeInfo * info, gpointer data)
+{
+  GstClockTime now = get_current_time();
+  GST_BUFFER_PTS(GST_PAD_PROBE_INFO_BUFFER(info)) = now;
+  GST_BUFFER_DTS(GST_PAD_PROBE_INFO_BUFFER(info)) = now;
+
+  return GST_PAD_PROBE_OK;
+}
+
 gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
 {
   GError *error = NULL;
@@ -406,12 +417,7 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         if (start < 0)
           start += get_current_time();
 
-        // Adjust start by base_time to get time relative to pipeline clock
-        start -= app->base_time;
-
         GST_INFO ("%20lu: get_current_time()",  GST_TIME_AS_MSECONDS(get_current_time()));
-        GST_INFO ("%20lu: base_time", GST_TIME_AS_MSECONDS(app->base_time));
-        GST_INFO ("%20lu: get_current_time - base_time", GST_TIME_AS_MSECONDS(get_current_time() - app->base_time));
         GST_INFO ("%20ld: start", GST_TIME_AS_MSECONDS(start));
 
         app->clock_start = start;
@@ -641,6 +647,10 @@ main (int argc, char *argv[])
   app->blockpad = gst_element_get_static_pad (app->queue2, "src");
   app->srcpad   = gst_element_get_static_pad (encoder, "src");
 
+  // Set timestamps on buffers coming out of source
+  gst_pad_add_probe (gst_element_get_static_pad (source, "src"),
+      GST_PAD_PROBE_TYPE_BUFFER, source_set_timestamps, app, NULL);
+
   block_pipeline(app);
 
   /*Verbose*/
@@ -651,8 +661,6 @@ main (int argc, char *argv[])
 
   /* Set the pipeline to "playing" state */
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
-
-  app->base_time = get_current_time();
 
   g_printf ("device-number: %d\n", device_number);
   g_printf ("speed-preset: %d\n", speed_preset);
