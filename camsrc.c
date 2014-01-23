@@ -425,8 +425,8 @@ gboolean io_callback(GIOChannel *source, GIOCondition condition, gpointer data)
         app->clock_end = start + duration;
         strcpy(app->file_location, filepath);
 
-        // May not request clips from the future
-        if (app->clock_start > get_current_time() || app->clock_end > get_current_time()) {
+        // May not request clips from the future, or clips longer than one minute
+        if (app->clock_start > get_current_time() || duration > 60 * GST_SECOND) {
           GST_WARNING ("command parameters invalid");
           send_error_to_socket (416, "invalid time range requested", app);
           hangup (app);
