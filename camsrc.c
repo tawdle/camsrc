@@ -648,7 +648,7 @@ main (int argc, char *argv[])
   app->srcpad   = gst_element_get_static_pad (encoder, "src");
 
   // Set timestamps on buffers coming out of source
-  gst_pad_add_probe (gst_element_get_static_pad (source, "src"),
+  gst_pad_add_probe (gst_element_get_static_pad (source, device_number == DEVICE_NUMBER_TEST ? "src" : "videosrc"),
       GST_PAD_PROBE_TYPE_BUFFER, source_set_timestamps, app, NULL);
 
   block_pipeline(app);
@@ -662,10 +662,8 @@ main (int argc, char *argv[])
   /* Set the pipeline to "playing" state */
   gst_element_set_state (app->pipeline, GST_STATE_PLAYING);
 
-  g_printf ("device-number: %d\n", device_number);
-  g_printf ("speed-preset: %d\n", speed_preset);
-  g_printf ("bitrate: %d\n", bitrate);
-  g_printf ("camsrc listening on port %d...\n", port);
+  g_printf ("camsrc listening on port %d with device-number %d speed-preset %d bitrate %d...\n", 
+      port, device_number, speed_preset, bitrate);
 
   g_main_loop_run (app->loop);
 
